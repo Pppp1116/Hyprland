@@ -325,11 +325,15 @@ void CPointerManager::onCursorMoved() {
 
         auto CROSSES = !m->logicalBox().intersection(CURSORBOX).empty();
 
-        if (!CROSSES && state->cursorFrontBuffer) {
+        if (!CROSSES) {
+            state->lastCursorPosValid = false;
+            if (!state->cursorFrontBuffer)
+                continue;
+
             Log::logger->log(Log::TRACE, "onCursorMoved for output {}: cursor left the viewport, removing it from the backend", m->m_name);
             setHWCursorBuffer(state, nullptr);
             continue;
-        } else if (CROSSES && !state->cursorFrontBuffer) {
+        } else if (!state->cursorFrontBuffer) {
             Log::logger->log(Log::TRACE, "onCursorMoved for output {}: cursor entered the output, but no front buffer, forcing recalc", m->m_name);
             recalc = true;
         }
@@ -343,9 +347,20 @@ void CPointerManager::onCursorMoved() {
             continue;
 
         const auto CURSORPOS = getCursorPosForMonitor(m);
-        m->m_output->moveCursor(CURSORPOS, m->shouldSkipScheduleFrameOnMouseEvent());
 
-        state->monitor->m_scanoutNeedsCursorUpdate = true;
+        // High-Hz pointer devices may emit duplicate position events. Avoid redundant backend cursor moves.
+        if (state->lastCursorPosValid && CURSORPOS == state->lastCursorPos)
+            continue;
+
+        const bool SHOULD_SKIP_SCHEDULER = m->shouldSkipScheduleFrameOnMouseEvent();
+        m->m_output->moveCursor(CURSORPOS, SHOULD_SKIP_SCHEDULER);
+        state->lastCursorPos      = CURSORPOS;
+        state->lastCursorPosValid = true;
+
+        // If we're intentionally skipping cursor-triggered frame scheduling (fullscreen+VRR path),
+        // avoid forcing an extra direct-scanout cursor update commit for every pointer movement.
+        // Never clear an already pending update here: shape/hotspot/visibility changes may have set it.
+        state->monitor->m_scanoutNeedsCursorUpdate = state->monitor->m_scanoutNeedsCursorUpdate || !SHOULD_SKIP_SCHEDULER;
     }
 
     if (recalc)
@@ -358,8 +373,9 @@ bool CPointerManager::attemptHardwareCursor(SP<CPointerManager::SMonitorPointerS
     if (!(output->getBackend()->capabilities() & Aquamarine::IBackendImplementation::eBackendCapabilities::AQ_BACKEND_CAPABILITY_POINTER))
         return false;
 
-    const auto CURSORPOS = getCursorPosForMonitor(state->monitor.lock());
-    state->monitor->m_output->moveCursor(CURSORPOS, state->monitor->shouldSkipScheduleFrameOnMouseEvent());
+    const auto CURSORPOS             = getCursorPosForMonitor(state->monitor.lock());
+    const bool SHOULD_SKIP_SCHEDULER = state->monitor->shouldSkipScheduleFrameOnMouseEvent();
+    state->monitor->m_output->moveCursor(CURSORPOS, SHOULD_SKIP_SCHEDULER);
 
     auto texture = getCurrentCursorTexture();
 
@@ -402,9 +418,13 @@ bool CPointerManager::setHWCursorBuffer(SP<SMonitorPointerState> state, SP<Aquam
 
     state->cursorFrontBuffer = buf;
 
-    if (!state->monitor->shouldSkipScheduleFrameOnMouseEvent())
+    const bool SHOULD_SKIP_SCHEDULER = state->monitor->shouldSkipScheduleFrameOnMouseEvent();
+
+    if (!SHOULD_SKIP_SCHEDULER)
         g_pCompositor->scheduleFrameForMonitor(state->monitor.lock(), Aquamarine::IOutput::AQ_SCHEDULE_CURSOR_SHAPE);
 
+    // Cursor shape/hotspot/buffer transitions are always materially visible and must not be dropped.
+    // Keep DS cursor-refresh pending even if pointer-move scheduling is currently skipped.
     state->monitor->m_scanoutNeedsCursorUpdate = true;
 
     return true;
