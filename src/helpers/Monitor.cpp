@@ -2118,7 +2118,7 @@ bool CMonitor::attemptDirectScanout() {
     static const auto PSAMEFIFO = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer_fifo");
     static const auto PSCANOUT  = CConfigValue<Hyprlang::INT>("debug:scanout");
 
-    const auto        blockedReason = isDSBlocked();
+    const auto        blockedReason = isDSBlocked(true);
     if (blockedReason) {
         if (m_lastDSBlockedReasons != blockedReason) {
             const auto PCANDIDATE = m_solitaryClient.lock();
@@ -2144,11 +2144,6 @@ bool CMonitor::attemptDirectScanout() {
     const auto PSURFACE   = PCANDIDATE->getSolitaryResource();
     const auto params     = PSURFACE->m_current.buffer->dmabuf();
 
-    if (m_lastDSBlockedReasons != DS_OK)
-        Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
-
-    m_lastDSBlockedReasons = DS_OK;
-
     Log::logger->log(Log::TRACE, "attemptDirectScanout: surface {:x} passed, will attempt, buffer {} fmt: {} -> {} (mod {})", rc<uintptr_t>(PSURFACE.get()),
                      rc<uintptr_t>(PSURFACE->m_current.buffer.m_buffer.get()), m_drmFormat, params.format, params.modifier);
 
@@ -2161,17 +2156,24 @@ bool CMonitor::attemptDirectScanout() {
         if (m_scanoutNeedsCursorUpdate) {
             if (!m_state.test()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed basic test on cursor update");
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 return false;
             }
 
             if (!m_output->commit()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed to commit cursor update");
                 m_lastScanout.reset();
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 return false;
             }
 
             m_scanoutNeedsCursorUpdate = false;
         }
+
+        if (m_lastDSBlockedReasons != DS_OK)
+            Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+
+        m_lastDSBlockedReasons = DS_OK;
 
         //#TODO this entire bit is bootleg deluxe, above bit is to not make vrr go down the drain, returning early here means fifo gets forever locked.
         if (PSURFACE->m_fifo && !m_tearingState.activelyTearing && *PSAMEFIFO)
@@ -2235,6 +2237,10 @@ bool CMonitor::attemptDirectScanout() {
         Log::logger->log(Log::DEBUG, "Entered a direct scanout to {:x}: \"{}\"", rc<uintptr_t>(PCANDIDATE.get()), PCANDIDATE->m_title);
     }
 
+    if (m_lastDSBlockedReasons != DS_OK)
+        Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+
+    m_lastDSBlockedReasons     = DS_OK;
     m_scanoutNeedsCursorUpdate = false;
 
     if (!PBUFFER->lockedByBackend || PBUFFER->m_hlEvents.backendRelease)

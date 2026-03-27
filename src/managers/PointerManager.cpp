@@ -420,8 +420,9 @@ bool CPointerManager::setHWCursorBuffer(SP<SMonitorPointerState> state, SP<Aquam
 
     const bool SHOULD_SKIP_SCHEDULER = state->monitor->shouldSkipScheduleFrameOnMouseEvent();
 
-    if (!SHOULD_SKIP_SCHEDULER)
-        g_pCompositor->scheduleFrameForMonitor(state->monitor.lock(), Aquamarine::IOutput::AQ_SCHEDULE_CURSOR_SHAPE);
+    // Always schedule cursor shape updates, even when skipping normal frame scheduling,
+    // to ensure m_scanoutNeedsCursorUpdate is serviced promptly for direct scanout
+    g_pCompositor->scheduleFrameForMonitor(state->monitor.lock(), Aquamarine::IOutput::AQ_SCHEDULE_CURSOR_SHAPE);
 
     // Cursor shape/hotspot/buffer transitions are always materially visible and must not be dropped.
     // Keep DS cursor-refresh pending even if pointer-move scheduling is currently skipped.

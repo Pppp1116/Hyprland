@@ -2714,7 +2714,6 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
         Log::logger->log(Log::TRACE, "explicit-sync on {}: {} (scanout {}, fullscreen {})", pMonitor->szName, explicitSyncActive ? "active" : "inactive",
                          !pMonitor->m_lastScanout.expired(), FS_WINDOW ? FS_WINDOW->m_title : "<none>");
     }
-    pMonitor->m_lastExplicitSyncActive = explicitSyncActive;
 
     bool ok = pMonitor->m_state.commit();
     if (!ok) {
@@ -2724,6 +2723,7 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
             ok = pMonitor->m_state.commit();
             if (ok) {
                 pMonitor->m_explicitSyncFallbacks++;
+                pMonitor->m_lastExplicitSyncActive = false;
                 if (*PEXPLICIT && (pMonitor->m_explicitSyncFallbacks == 1 || pMonitor->m_explicitSyncFallbacks % 100 == 0))
                     Log::logger->log(Log::WARN, "explicit-sync fallback on {} succeeded without fence (count {})", pMonitor->szName, pMonitor->m_explicitSyncFallbacks);
             }
@@ -2737,6 +2737,9 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
             pMonitor->m_damage.damageEntire();
         }
     }
+
+    if (ok)
+        pMonitor->m_lastExplicitSyncActive = explicitSyncActive;
 
     return ok;
 }
