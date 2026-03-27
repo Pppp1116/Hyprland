@@ -1962,6 +1962,18 @@ namespace Config::Supplementary {
             .data        = SConfigOptionDescription::SBoolData{true},
         },
         SConfigOptionDescription{
+            .value       = "debug:scanout",
+            .description = "Enables additional direct-scanout blocker diagnostics",
+            .type        = CONFIG_OPTION_BOOL,
+            .data        = SConfigOptionDescription::SBoolData{false},
+        },
+        SConfigOptionDescription{
+            .value       = "debug:explicit_sync",
+            .description = "Enables additional explicit-sync commit diagnostics",
+            .type        = CONFIG_OPTION_BOOL,
+            .data        = SConfigOptionDescription::SBoolData{false},
+        },
+        SConfigOptionDescription{
             .value       = "debug:fifo_pending_workaround",
             .description = "Fifo workaround for empty pending list",
             .type        = CONFIG_OPTION_BOOL,
