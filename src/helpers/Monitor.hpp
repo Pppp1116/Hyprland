@@ -66,10 +66,13 @@ class CMonitor {
     PHLWORKSPACE                m_activeSpecialWorkspace = nullptr;
     float                       m_setScale               = 1; // scale set by cfg
     float                       m_scale                  = 1; // real scale
+    float                       m_autoBaseScale          = 1; // auto-selected base UI scale for this physical monitor
+    Vector2D                    m_autoReferencePixelSize = Vector2D(0, 0); // reference mode pixel size used for auto normalization
 
     std::string                 m_name             = "";
     std::string                 m_description      = "";
     std::string                 m_shortDescription = "";
+    std::string                 m_stableId         = "";
 
     drmModeModeInfo             m_customDrmMode = {};
 
@@ -265,7 +268,11 @@ class CMonitor {
     void        setMirror(const std::string&);
     bool        isMirror();
     bool        matchesStaticSelector(const std::string& selector) const;
-    float       getDefaultScale();
+    std::string stableIdentifier() const;
+    Vector2D    pickAutoScaleReferenceMode() const;
+    float       getDefaultScaleForPixelSize(const Vector2D& pixelSize) const;
+    float       computeAutoScaleForMode(const Vector2D& targetPixelSize);
+    float       getDefaultScale() const;
     void        changeWorkspace(const PHLWORKSPACE& pWorkspace, bool internal = false, bool noMouseMove = false, bool noFocus = false);
     void        changeWorkspace(const WORKSPACEID& id, bool internal = false, bool noMouseMove = false, bool noFocus = false);
     void        setSpecialWorkspace(const PHLWORKSPACE& pWorkspace);
