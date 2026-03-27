@@ -59,6 +59,11 @@ using namespace Hyprutils::OS;
 using enum NContentType::eContentType;
 using namespace NColorManagement;
 
+static const std::array<const char*, CMonitor::DS_CHECKS_COUNT> DS_REASONS_TEXT = {
+    "unknown reason",    "user settings",   "windowed mode",           "content type",   "monitor mirrors",   "screen record/screenshot", "software renders/cursors",
+    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",
+};
+
 CMonitor::CMonitor(SP<Aquamarine::IOutput> output_) : m_state(this), m_output(output_), m_imageDescription(DEFAULT_IMAGE_DESCRIPTION) {
     g_pAnimationManager->createAnimation(0.f, m_specialFade, Config::animationTree()->getAnimationPropertyConfig("specialWorkspaceIn"), AVARDAMAGE_NONE);
     m_specialFade->setUpdateCallback([this](auto) { g_pHyprRenderer->damageMonitor(m_self.lock()); });
@@ -1132,6 +1137,7 @@ void CMonitor::addDamage(const CBox& box) {
 bool CMonitor::shouldSkipScheduleFrameOnMouseEvent() {
     static auto PNOBREAK = CConfigValue<Hyprlang::INT>("cursor:no_break_fs_vrr");
     static auto PMINRR   = CConfigValue<Hyprlang::INT>("cursor:min_refresh_rate");
+    static auto PSCANOUT = CConfigValue<Hyprlang::INT>("debug:scanout");
 
     // skip scheduling extra frames for fullsreen apps with vrr
     const auto FS_WINDOW          = getFullscreenWindow();
@@ -1139,14 +1145,22 @@ bool CMonitor::shouldSkipScheduleFrameOnMouseEvent() {
     const bool noBreak            = FS_WINDOW && (*PNOBREAK == 1 || (*PNOBREAK == 2 && FS_WINDOW->getContentType() == CONTENT_TYPE_GAME));
     const bool shouldSkip         = (!shouldRenderCursor || noBreak) && m_output->state->state().adaptiveSync;
 
+    bool finalShouldSkip = shouldSkip;
+
     // keep requested minimum refresh rate
     if (shouldSkip && *PMINRR && m_lastPresentationTimer.getMillis() > 1000.0f / *PMINRR) {
         // damage whole screen because some previous cursor box damages were skipped
         m_damage.damageEntire();
-        return false;
+        finalShouldSkip = false;
     }
 
-    return shouldSkip;
+    if (*PSCANOUT && finalShouldSkip != m_lastCursorMoveSkip) {
+        Log::logger->log(Log::TRACE, "cursor scheduling on {}: {} (vrr {}, renderCursor {}, noBreak {}, fullscreen {})", szName, finalShouldSkip ? "skip" : "schedule",
+                         m_output->state->state().adaptiveSync, shouldRenderCursor, noBreak, FS_WINDOW ? FS_WINDOW->m_title : "<none>");
+    }
+
+    m_lastCursorMoveSkip = finalShouldSkip;
+    return finalShouldSkip;
 }
 
 bool CMonitor::isMirror() {
@@ -1853,14 +1867,16 @@ uint32_t CMonitor::isSolitaryBlocked(bool full) {
             return reasons;
     }
 
-    if (!m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY].empty()) {
-        reasons |= SC_OVERLAYS;
-        if (!full)
-            return reasons;
+    for (auto const& overlayls : m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]) {
+        if (overlayls->aliveAndVisible() && overlayls->m_alpha->value() > 0.f) {
+            reasons |= SC_OVERLAYS;
+            if (!full)
+                return reasons;
+        }
     }
 
     for (auto const& topls : m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_TOP]) {
-        if (topls->m_alpha->value() != 0.f) {
+        if (topls->aliveAndVisible() && topls->m_alpha->value() > 0.f) {
             reasons |= SC_OVERLAYS;
             if (!full)
                 return reasons;
@@ -2036,17 +2052,102 @@ uint16_t CMonitor::isDSBlocked(bool full) {
     return reasons;
 }
 
+std::string CMonitor::getDSBlockedReasons(uint16_t reasons) const {
+    if (!reasons)
+        return "none";
+
+    std::vector<std::string> reasonParts;
+    std::vector<std::string> categoryParts;
+
+    for (size_t i = 0; i < DS_REASONS_TEXT.size(); ++i) {
+        if (!(reasons & (1 << i)))
+            continue;
+
+        reasonParts.emplace_back(DS_REASONS_TEXT[i]);
+
+        if ((1 << i) == DS_BLOCK_TRANSFORM)
+            categoryParts.emplace_back("geometry");
+        else if ((1 << i) == DS_BLOCK_SW)
+            categoryParts.emplace_back("cursor");
+        else if ((1 << i) == DS_BLOCK_FAILED)
+            categoryParts.emplace_back("kms");
+        else if ((1 << i) == DS_BLOCK_CM)
+            categoryParts.emplace_back("color");
+        else if ((1 << i) == DS_BLOCK_CANDIDATE || (1 << i) == DS_BLOCK_SURFACE || (1 << i) == DS_BLOCK_DMA)
+            categoryParts.emplace_back("protocol");
+        else if ((1 << i) == DS_BLOCK_WINDOWED || (1 << i) == DS_BLOCK_CONTENT)
+            categoryParts.emplace_back("fullscreen");
+        else if ((1 << i) == DS_BLOCK_MIRROR || (1 << i) == DS_BLOCK_RECORD || (1 << i) == DS_BLOCK_USER)
+            categoryParts.emplace_back("policy");
+    }
+
+    std::string reasonStr;
+    for (const auto& reason : reasonParts) {
+        if (!reasonStr.empty())
+            reasonStr += ", ";
+        reasonStr += reason;
+    }
+
+    std::vector<std::string> uniqueCategories;
+    for (const auto& category : categoryParts) {
+        if (std::ranges::find(uniqueCategories, category) != uniqueCategories.end())
+            continue;
+        uniqueCategories.emplace_back(category);
+    }
+
+    std::string categories;
+    for (const auto& category : uniqueCategories) {
+        if (!categories.empty())
+            categories += "+";
+        categories += category;
+    }
+
+    const auto unknownBits = reasons & ~((1u << DS_REASONS_TEXT.size()) - 1u);
+    if (unknownBits) {
+        if (!reasonStr.empty())
+            reasonStr += ", ";
+        reasonStr += std::format("unknown bits 0x{:x}", unknownBits);
+    }
+
+    if (!categories.empty())
+        return std::format("{} [{}]", reasonStr, categories);
+
+    return reasonStr.empty() ? "unknown reason" : reasonStr;
+}
+
 bool CMonitor::attemptDirectScanout() {
     static const auto PSAME     = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer");
     static const auto PSAMEFIFO = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer_fifo");
+    static const auto PSCANOUT  = CConfigValue<Hyprlang::INT>("debug:scanout");
 
-    const auto        blockedReason = isDSBlocked();
-    if (blockedReason)
+    const auto        blockedReason = isDSBlocked(true);
+    if (blockedReason) {
+        const auto previousReasons = m_lastDSBlockedReasons;
+        m_lastDSBlockedReasons     = blockedReason;
+
+        if (previousReasons != blockedReason) {
+            const auto PCANDIDATE = m_solitaryClient.lock();
+            Log::logger->log(Log::DEBUG, "attemptDirectScanout: blocked on {}: {}", szName, getDSBlockedReasons(blockedReason));
+
+            if (*PSCANOUT && (blockedReason & DS_BLOCK_CANDIDATE))
+                Log::logger->log(Log::TRACE, "attemptDirectScanout: solitary blockers on {}: 0x{:x}", szName, isSolitaryBlocked(true));
+
+            if (*PSCANOUT && (blockedReason & DS_BLOCK_TRANSFORM) && PCANDIDATE) {
+                const auto PSURFACE = PCANDIDATE->getSolitaryResource();
+                if (PSURFACE) {
+                    Log::logger->log(Log::TRACE, "attemptDirectScanout: surface transform mismatch on {}: buffer {} transform {}, monitor needs {} transform {}", szName,
+                                     PSURFACE->m_current.bufferSize, PSURFACE->m_current.transform, m_pixelSize, m_transform);
+                }
+            }
+        }
         return false;
+    }
 
     const auto PCANDIDATE = m_solitaryClient.lock();
     const auto PSURFACE   = PCANDIDATE->getSolitaryResource();
     const auto params     = PSURFACE->m_current.buffer->dmabuf();
+
+    const bool wasBlocked = m_lastDSBlockedReasons != DS_OK;
 
     Log::logger->log(Log::TRACE, "attemptDirectScanout: surface {:x} passed, will attempt, buffer {} fmt: {} -> {} (mod {})", rc<uintptr_t>(PSURFACE.get()),
                      rc<uintptr_t>(PSURFACE->m_current.buffer.m_buffer.get()), m_drmFormat, params.format, params.modifier);
@@ -2060,11 +2161,13 @@ bool CMonitor::attemptDirectScanout() {
         if (m_scanoutNeedsCursorUpdate) {
             if (!m_state.test()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed basic test on cursor update");
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 return false;
             }
 
             if (!m_output->commit()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed to commit cursor update");
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 m_lastScanout.reset();
                 return false;
             }
@@ -2075,6 +2178,10 @@ bool CMonitor::attemptDirectScanout() {
         //#TODO this entire bit is bootleg deluxe, above bit is to not make vrr go down the drain, returning early here means fifo gets forever locked.
         if (PSURFACE->m_fifo && !m_tearingState.activelyTearing && *PSAMEFIFO)
             PSURFACE->m_stateQueue.unlockFirst(LOCK_REASON_FIFO);
+
+        if (wasBlocked)
+            Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+        m_lastDSBlockedReasons = DS_OK;
 
         return true;
     }
@@ -2098,6 +2205,7 @@ bool CMonitor::attemptDirectScanout() {
 
     if (!m_state.test()) {
         Log::logger->log(Log::TRACE, "attemptDirectScanout: failed basic test");
+        m_lastDSBlockedReasons = DS_BLOCK_FAILED;
         return false;
     }
 
@@ -2123,9 +2231,13 @@ bool CMonitor::attemptDirectScanout() {
 
     if (!ok) {
         Log::logger->log(Log::TRACE, "attemptDirectScanout: failed to scanout surface");
+        m_lastDSBlockedReasons = DS_BLOCK_FAILED;
+        m_inFence              = {};
         m_lastScanout.reset();
         return false;
     }
+
+    m_inFence = {};
 
     if (m_lastScanout.expired()) {
         m_lastScanout = PCANDIDATE;
@@ -2133,6 +2245,10 @@ bool CMonitor::attemptDirectScanout() {
     }
 
     m_scanoutNeedsCursorUpdate = false;
+
+    if (wasBlocked)
+        Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+    m_lastDSBlockedReasons = DS_OK;
 
     if (!PBUFFER->lockedByBackend || PBUFFER->m_hlEvents.backendRelease)
         return true;
