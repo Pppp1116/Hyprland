@@ -174,6 +174,8 @@ class CPointerManager {
         bool                    entered        = false;
         bool                    hwApplied      = false;
         bool                    cursorRendered = false;
+        Vector2D                lastCursorPos  = {};
+        bool                    lastCursorPosValid = false;
 
         SP<Aquamarine::IBuffer> cursorFrontBuffer;
     };
