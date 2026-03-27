@@ -218,6 +218,8 @@ void CMonitor::onConnect(bool noRule) {
     m_shortDescription = trim(std::format("{} {} {}", m_output->make, m_output->model, m_output->serial));
     std::erase(m_shortDescription, ',');
 
+    m_stableId = stableIdentifier();
+
     if (m_output->getBackend()->type() != Aquamarine::AQ_BACKEND_DRM)
         m_createdByUser = true; // should be true. WL and Headless backends should be addable / removable
 
@@ -342,10 +344,11 @@ void CMonitor::onConnect(bool noRule) {
         }
     }
 
-    Log::logger->log(Log::DEBUG, "checking if we have seen this monitor before: {}", m_name);
+    Log::logger->log(Log::DEBUG, "checking if we have seen this monitor before: {} ({})", m_name, m_stableId);
     // if we saw this monitor before, set it to the workspace it was on
-    if (g_pCompositor->m_seenMonitorWorkspaceMap.contains(m_name)) {
-        auto workspaceID = g_pCompositor->m_seenMonitorWorkspaceMap[m_name];
+    const auto SEENIT = g_pCompositor->m_seenMonitorWorkspaceMap.find(m_stableId);
+    if (SEENIT != g_pCompositor->m_seenMonitorWorkspaceMap.end() || g_pCompositor->m_seenMonitorWorkspaceMap.contains(m_name)) {
+        auto workspaceID = SEENIT != g_pCompositor->m_seenMonitorWorkspaceMap.end() ? SEENIT->second : g_pCompositor->m_seenMonitorWorkspaceMap[m_name];
         Log::logger->log(Log::DEBUG, "Monitor {} was on workspace {}, setting it to that", m_name, workspaceID);
         auto ws = g_pCompositor->getWorkspaceByID(workspaceID);
         if (ws) {
@@ -394,7 +397,8 @@ void CMonitor::onDisconnect(bool destroy) {
     // record what workspace this monitor was on
     if (m_activeWorkspace) {
         Log::logger->log(Log::DEBUG, "Disconnecting Monitor {} was on workspace {}", m_name, m_activeWorkspace->m_id);
-        g_pCompositor->m_seenMonitorWorkspaceMap[m_name] = m_activeWorkspace->m_id;
+        g_pCompositor->m_seenMonitorWorkspaceMap[m_name]     = m_activeWorkspace->m_id;
+        g_pCompositor->m_seenMonitorWorkspaceMap[m_stableId] = m_activeWorkspace->m_id;
     }
 
     // Cleanup everything. Move windows back, snap cursor, shit.
@@ -623,6 +627,7 @@ void CMonitor::applyCMType(NCMType::eCMType cmType, NTransferFunction::eTF cmSdr
 bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force) {
 
     static auto PDISABLESCALECHECKS = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
+    static auto PMODEAWAREAUTOSCALE = CConfigValue<Hyprlang::INT>("misc:monitor_mode_aware_auto_scale");
 
     Log::logger->log(Log::DEBUG, "Applying monitor rule for {}", m_name);
 
@@ -682,9 +687,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force)
     if (RULE->m_scale > 0.1)
         m_scale = RULE->m_scale;
     else {
-        autoScale               = true;
-        const auto DEFAULTSCALE = getDefaultScale();
-        m_scale                 = DEFAULTSCALE;
+        autoScale = true;
+        // Keep legacy behavior by default (auto scale from the current mode's context).
+        // Mode-aware reference policy is opt-in.
+        m_scale = *PMODEAWAREAUTOSCALE ? 1.F : getDefaultScale();
     }
 
     m_setScale     = m_scale;
@@ -909,6 +915,9 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force)
         || m_createdByUser;                             // wayland backend doesn't allow for disabling adaptive_sync
 
     m_pixelSize = m_size;
+
+    if (autoScale && *PMODEAWAREAUTOSCALE)
+        m_scale = computeAutoScaleForMode(m_pixelSize);
 
     // clang-format off
     static const std::array<std::vector<std::pair<std::string, uint32_t>>, 2> formats{
@@ -1150,6 +1159,9 @@ bool CMonitor::matchesStaticSelector(const std::string& selector) const {
         const auto DESCRIPTIONSELECTOR = trim(selector.substr(5));
 
         return m_description.starts_with(DESCRIPTIONSELECTOR) || m_shortDescription.starts_with(DESCRIPTIONSELECTOR);
+    } else if (selector.starts_with("id:")) {
+        const auto IDSELECTOR = trim(selector.substr(3));
+        return m_stableId.starts_with(IDSELECTOR);
     } else {
         // match by selector
         return m_name == selector;
@@ -1311,22 +1323,130 @@ void CMonitor::setMirror(const std::string& mirrorOf) {
     m_events.modeChanged.emit();
 }
 
-float CMonitor::getDefaultScale() {
-    if (!m_enabled)
+std::string CMonitor::stableIdentifier() const {
+    if (!m_output)
+        return m_name;
+
+    auto normalize = [](std::string v) {
+        std::erase(v, ',');
+        return trim(v);
+    };
+
+    const auto make     = normalize(m_output->make);
+    const auto model    = normalize(m_output->model);
+    const auto serial   = normalize(m_output->serial);
+    const auto physSize = m_output->physicalSize;
+
+    // Prefer EDID-like identity when serial is present.
+    if (!serial.empty() && (!make.empty() || !model.empty()))
+        return std::format("edid:{}|{}|{}|{}x{}", make, model, serial, physSize.x, physSize.y);
+
+    // If serial is missing, add connector name to reduce collisions between identical monitors.
+    // This is less stable across connector renames, but avoids accidental conflation.
+    if (!make.empty() || !model.empty())
+        return std::format("mm:{}|{}|{}x{}|{}", make, model, physSize.x, physSize.y, m_name);
+
+    if (!m_shortDescription.empty())
+        return std::format("desc:{}|{}x{}", m_shortDescription, physSize.x, physSize.y);
+
+    if (!m_description.empty())
+        return std::format("desc:{}|{}x{}", m_description, physSize.x, physSize.y);
+
+    return std::format("name:{}|{}x{}", m_name, physSize.x, physSize.y);
+}
+
+Vector2D CMonitor::pickAutoScaleReferenceMode() const {
+    if (!m_output || m_output->modes.empty())
+        return m_pixelSize;
+
+    auto best = m_output->modes.front()->pixelSize;
+    auto area = [](const Vector2D& size) { return size.x * size.y; };
+
+    const bool hasCurrentSize = m_pixelSize.x > 0 && m_pixelSize.y > 0;
+    const auto currentAspect  = hasCurrentSize ? m_pixelSize.x / m_pixelSize.y : 0.F;
+
+    bool       matchedAspect = false;
+
+    for (auto const& mode : m_output->modes) {
+        if (!mode)
+            continue;
+
+        const auto candidate = mode->pixelSize;
+        const bool sameAspect =
+            !hasCurrentSize || (candidate.x > 0 && candidate.y > 0 && std::abs((candidate.x / candidate.y) - currentAspect) < 0.02F);
+
+        if (sameAspect) {
+            if (!matchedAspect || area(candidate) > area(best)) {
+                matchedAspect = true;
+                best          = candidate;
+            }
+            continue;
+        }
+
+        if (!matchedAspect && area(candidate) > area(best))
+            best = mode->pixelSize;
+    }
+
+    return best;
+}
+
+float CMonitor::getDefaultScaleForPixelSize(const Vector2D& pixelSize) const {
+    if (!m_output || pixelSize.x <= 0 || pixelSize.y <= 0)
+        return 1;
+
+    if (m_output->physicalSize.x <= 0 || m_output->physicalSize.y <= 0)
         return 1;
 
     static constexpr double MMPERINCH = 25.4;
 
-    const auto              DIAGONALPX = sqrt(pow(m_pixelSize.x, 2) + pow(m_pixelSize.y, 2));
+    const auto              DIAGONALPX = sqrt(pow(pixelSize.x, 2) + pow(pixelSize.y, 2));
     const auto              DIAGONALIN = sqrt(pow(m_output->physicalSize.x / MMPERINCH, 2) + pow(m_output->physicalSize.y / MMPERINCH, 2));
 
-    const auto              PPI = DIAGONALPX / DIAGONALIN;
+    if (DIAGONALIN <= 0.0)
+        return 1;
+
+    const auto PPI = DIAGONALPX / DIAGONALIN;
 
     if (PPI > 200 /* High PPI, 2x*/)
         return 2;
     else if (PPI > 140 /* Medium PPI, 1.5x*/)
         return 1.5;
     return 1;
+}
+
+float CMonitor::computeAutoScaleForMode(const Vector2D& targetPixelSize) {
+    const auto REFERENCE = pickAutoScaleReferenceMode();
+
+    m_autoReferencePixelSize = REFERENCE;
+    m_autoBaseScale          = getDefaultScaleForPixelSize(REFERENCE);
+
+    if (targetPixelSize.x <= 0 || targetPixelSize.y <= 0 || REFERENCE.x <= 0 || REFERENCE.y <= 0)
+        return std::max(0.25F, m_autoBaseScale);
+
+    const auto targetAspect = targetPixelSize.x / targetPixelSize.y;
+    const auto refAspect    = REFERENCE.x / REFERENCE.y;
+    const auto sameAspect   = std::abs(targetAspect - refAspect) < 0.02F;
+
+    float      normalization = 1.F;
+    if (sameAspect) {
+        const auto ratioX = targetPixelSize.x / REFERENCE.x;
+        const auto ratioY = targetPixelSize.y / REFERENCE.y;
+        const auto ratio  = std::min(ratioX, ratioY);
+
+        // Normalize only for large same-aspect jumps (e.g. dual-mode 1080p <-> 4K).
+        // Small resolution shifts (or refresh-only changes) keep base scale.
+        if (ratio <= 0.7F || ratio >= 1.43F)
+            normalization = ratio;
+    }
+
+    auto roundQuarterStep = [](float v) { return std::round(v * 4.F) / 4.F; };
+
+    const auto effective = roundQuarterStep(m_autoBaseScale * normalization);
+    return std::clamp(effective, 0.25F, 8.F);
+}
+
+float CMonitor::getDefaultScale() const {
+    return getDefaultScaleForPixelSize(m_pixelSize);
 }
 
 static bool shouldWraparound(const WORKSPACEID id1, const WORKSPACEID id2) {

@@ -1439,6 +1439,12 @@ namespace Config::Supplementary {
             .data        = SConfigOptionDescription::SBoolData{true},
         },
         SConfigOptionDescription{
+            .value       = "misc:monitor_mode_aware_auto_scale",
+            .description = "enables reference-mode auto scale normalization for large same-aspect monitor mode jumps (e.g. 1080p <-> 4K on one panel)",
+            .type        = CONFIG_OPTION_BOOL,
+            .data        = SConfigOptionDescription::SBoolData{false},
+        },
+        SConfigOptionDescription{
             .value       = "misc:disable_scale_notification",
             .description = "disables notification popup when a monitor fails to set a suitable scale and falls back to suggested",
             .type        = CONFIG_OPTION_BOOL,
