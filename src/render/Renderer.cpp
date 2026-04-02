@@ -1902,7 +1902,8 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
         pMonitor->m_directScanoutIsActive = true;
         return;
     } else if (!pMonitor->m_lastScanout.expired() || pMonitor->m_directScanoutIsActive) {
-        Log::logger->log(Log::DEBUG, "Left a direct scanout.");
+        const auto reason = pMonitor->m_lastDSBlockedReasons != CMonitor::DS_OK ? pMonitor->m_lastDSBlockedReasons : pMonitor->isDSBlocked(true);
+        Log::logger->log(Log::DEBUG, "Left a direct scanout on {} ({}).", pMonitor->szName, pMonitor->getDSBlockedReasons(reason));
         pMonitor->m_lastScanout.reset();
         pMonitor->m_directScanoutIsActive = false;
 
@@ -2149,6 +2150,7 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
     static auto PPASS      = CConfigValue<Hyprlang::INT>("render:cm_fs_passthrough");
     static auto PAUTOHDR   = CConfigValue<Hyprlang::INT>("render:cm_auto_hdr");
     static auto PNONSHADER = CConfigValue<Hyprlang::INT>("render:non_shader_cm");
+    static auto PEXPLICIT  = CConfigValue<Hyprlang::INT>("debug:explicit_sync");
 
     const bool  configuredHDR = (pMonitor->m_cmType == NCMType::CM_HDR_EDID || pMonitor->m_cmType == NCMType::CM_HDR);
     bool        wantHDR       = configuredHDR;
@@ -2264,12 +2266,21 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
 
     pMonitor->m_previousFSWindow = FS_WINDOW;
 
+    const bool explicitSyncActive = pMonitor->m_inFence.isValid();
+    bool       presentedExplicit  = explicitSyncActive;
+
     bool ok = pMonitor->m_state.commit();
     if (!ok) {
-        if (pMonitor->m_inFence.isValid()) {
+        if (explicitSyncActive) {
             Log::logger->log(Log::TRACE, "Monitor state commit failed, retrying without a fence");
             pMonitor->m_output->state->resetExplicitFences();
             ok = pMonitor->m_state.commit();
+            if (ok) {
+                presentedExplicit = false;
+                pMonitor->m_explicitSyncFallbacks++;
+                if (*PEXPLICIT && (pMonitor->m_explicitSyncFallbacks == 1 || pMonitor->m_explicitSyncFallbacks % 100 == 0))
+                    Log::logger->log(Log::WARN, "explicit-sync fallback on {} succeeded without fence (count {})", pMonitor->szName, pMonitor->m_explicitSyncFallbacks);
+            }
         }
 
         if (!ok) {
@@ -2280,6 +2291,17 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
             pMonitor->m_damage.damageEntire();
         }
     }
+
+    if (ok) {
+        if (*PEXPLICIT && presentedExplicit != pMonitor->m_lastExplicitSyncActive) {
+            Log::logger->log(Log::TRACE, "explicit-sync on {}: {} (scanout {}, fullscreen {})", pMonitor->szName, presentedExplicit ? "active" : "inactive",
+                             !pMonitor->m_lastScanout.expired(), FS_WINDOW ? FS_WINDOW->m_title : "<none>");
+        }
+        pMonitor->m_lastExplicitSyncActive = presentedExplicit;
+    }
+
+    // fence fd is single-use for this commit attempt; clear it so stale state isn't interpreted as pending explicit sync later.
+    pMonitor->m_inFence = {};
 
     return ok;
 }

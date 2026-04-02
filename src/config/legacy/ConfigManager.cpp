@@ -535,6 +535,7 @@ CConfigManager::CConfigManager() {
     registerConfigVar("misc:enable_anr_dialog", Hyprlang::INT{1});
     registerConfigVar("misc:anr_missed_pings", Hyprlang::INT{5});
     registerConfigVar("misc:screencopy_force_8b", Hyprlang::INT{1});
+    registerConfigVar("misc:monitor_mode_aware_auto_scale", Hyprlang::INT{0});
     registerConfigVar("misc:disable_scale_notification", Hyprlang::INT{0});
     registerConfigVar("misc:size_limits_tiled", Hyprlang::INT{0});
 
@@ -594,6 +595,8 @@ CConfigManager::CConfigManager() {
     registerConfigVar("debug:full_cm_proto", Hyprlang::INT{0});
     registerConfigVar("debug:ds_handle_same_buffer", Hyprlang::INT{1});
     registerConfigVar("debug:ds_handle_same_buffer_fifo", Hyprlang::INT{1});
+    registerConfigVar("debug:scanout", Hyprlang::INT{0});
+    registerConfigVar("debug:explicit_sync", Hyprlang::INT{0});
     registerConfigVar("debug:fifo_pending_workaround", Hyprlang::INT{0});
     registerConfigVar("debug:render_solitary_wo_damage", Hyprlang::INT{0});
 
