@@ -115,10 +115,13 @@ class CMonitor {
     PHLWORKSPACE                m_activeSpecialWorkspace = nullptr;
     float                       m_setScale               = 1; // scale set by cfg
     float                       m_scale                  = 1; // real scale
+    float                       m_autoBaseScale          = 1; // auto-selected base UI scale for this physical monitor
+    Vector2D                    m_autoReferencePixelSize = Vector2D(0, 0); // reference mode pixel size used for auto normalization
 
     std::string                 m_name             = "";
     std::string                 m_description      = "";
     std::string                 m_shortDescription = "";
+    std::string                 m_stableId         = "";
 
     drmModeModeInfo             m_customDrmMode = {};
 
@@ -191,6 +194,10 @@ class CMonitor {
     PHLWINDOWREF m_lastScanout;
     bool         m_directScanoutIsActive    = false; // for cleanup logic. m_lastScanout.expired() can become true before the DS cleanup if client crashes/exits while DS is active.
     bool         m_scanoutNeedsCursorUpdate = false;
+    uint16_t     m_lastDSBlockedReasons     = 0;
+    bool         m_lastCursorMoveSkip       = false;
+    bool         m_lastExplicitSyncActive   = false;
+    uint32_t     m_explicitSyncFallbacks    = 0;
 
     // for special fade/blur
     PHLANIMVAR<float> m_specialFade;
@@ -249,7 +256,7 @@ class CMonitor {
         DS_BLOCK_FAILED    = (1 << 11),
         DS_BLOCK_CM        = (1 << 12),
 
-        DS_CHECKS_COUNT = 14,
+        DS_CHECKS_COUNT = 13,
     };
 
     // keep in sync with HyprCtl
@@ -305,7 +312,11 @@ class CMonitor {
     void        setMirror(const std::string&);
     bool        isMirror();
     bool        matchesStaticSelector(const std::string& selector) const;
-    float       getDefaultScale();
+    std::string stableIdentifier() const;
+    Vector2D    pickAutoScaleReferenceMode() const;
+    float       getDefaultScaleForPixelSize(const Vector2D& pixelSize) const;
+    float       computeAutoScaleForMode(const Vector2D& targetPixelSize);
+    float       getDefaultScale() const;
     void        changeWorkspace(const PHLWORKSPACE& pWorkspace, bool internal = false, bool noMouseMove = false, bool noFocus = false);
     void        changeWorkspace(const WORKSPACEID& id, bool internal = false, bool noMouseMove = false, bool noFocus = false);
     void        setSpecialWorkspace(const PHLWORKSPACE& pWorkspace);
@@ -322,6 +333,7 @@ class CMonitor {
     uint8_t     isTearingBlocked(bool full = false);
     bool        updateTearing();
     uint16_t    isDSBlocked(bool full = false);
+    std::string getDSBlockedReasons(uint16_t reasons) const;
     bool        attemptDirectScanout();
     void        setCTM(const Mat3x3& ctm);
     void        onCursorMovedOnMonitor();

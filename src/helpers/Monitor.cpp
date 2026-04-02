@@ -62,6 +62,11 @@ using namespace NColorManagement;
 using namespace Render::GL;
 using namespace Monitor;
 
+static const std::array<const char*, CMonitor::DS_CHECKS_COUNT> DS_REASONS_TEXT = {
+    "unknown reason",    "user settings",   "windowed mode",           "content type",   "monitor mirrors",   "screen record/screenshot", "software renders/cursors",
+    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",
+};
+
 CMonitor::CMonitor(SP<Aquamarine::IOutput> output_) : m_state(this), m_output(output_), m_imageDescription(DEFAULT_IMAGE_DESCRIPTION) {
     g_pAnimationManager->createAnimation(0.f, m_specialFade, Config::animationTree()->getAnimationPropertyConfig("specialWorkspaceIn"), AVARDAMAGE_NONE);
     m_specialFade->setUpdateCallback([this](auto) { g_pHyprRenderer->damageMonitor(m_self.lock()); });
@@ -221,6 +226,8 @@ void CMonitor::onConnect(bool noRule) {
     m_shortDescription = trim(std::format("{} {} {}", m_output->make, m_output->model, m_output->serial));
     std::erase(m_shortDescription, ',');
 
+    m_stableId = stableIdentifier();
+
     if (m_output->getBackend()->type() != Aquamarine::AQ_BACKEND_DRM)
         m_createdByUser = true; // should be true. WL and Headless backends should be addable / removable
 
@@ -345,10 +352,11 @@ void CMonitor::onConnect(bool noRule) {
         }
     }
 
-    Log::logger->log(Log::DEBUG, "checking if we have seen this monitor before: {}", m_name);
+    Log::logger->log(Log::DEBUG, "checking if we have seen this monitor before: {} ({})", m_name, m_stableId);
     // if we saw this monitor before, set it to the workspace it was on
-    if (g_pCompositor->m_seenMonitorWorkspaceMap.contains(m_name)) {
-        auto workspaceID = g_pCompositor->m_seenMonitorWorkspaceMap[m_name];
+    const auto SEENIT = g_pCompositor->m_seenMonitorWorkspaceMap.find(m_stableId);
+    if (SEENIT != g_pCompositor->m_seenMonitorWorkspaceMap.end() || g_pCompositor->m_seenMonitorWorkspaceMap.contains(m_name)) {
+        auto workspaceID = SEENIT != g_pCompositor->m_seenMonitorWorkspaceMap.end() ? SEENIT->second : g_pCompositor->m_seenMonitorWorkspaceMap[m_name];
         Log::logger->log(Log::DEBUG, "Monitor {} was on workspace {}, setting it to that", m_name, workspaceID);
         auto ws = g_pCompositor->getWorkspaceByID(workspaceID);
         if (ws) {
@@ -397,7 +405,8 @@ void CMonitor::onDisconnect(bool destroy) {
     // record what workspace this monitor was on
     if (m_activeWorkspace) {
         Log::logger->log(Log::DEBUG, "Disconnecting Monitor {} was on workspace {}", m_name, m_activeWorkspace->m_id);
-        g_pCompositor->m_seenMonitorWorkspaceMap[m_name] = m_activeWorkspace->m_id;
+        g_pCompositor->m_seenMonitorWorkspaceMap[m_name]     = m_activeWorkspace->m_id;
+        g_pCompositor->m_seenMonitorWorkspaceMap[m_stableId] = m_activeWorkspace->m_id;
     }
 
     // Cleanup everything. Move windows back, snap cursor, shit.
@@ -626,6 +635,7 @@ void CMonitor::applyCMType(NCMType::eCMType cmType, NTransferFunction::eTF cmSdr
 bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force) {
 
     static auto PDISABLESCALECHECKS = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
+    static auto PMODEAWAREAUTOSCALE = CConfigValue<Hyprlang::INT>("misc:monitor_mode_aware_auto_scale");
 
     Log::logger->log(Log::DEBUG, "Applying monitor rule for {}", m_name);
 
@@ -691,9 +701,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force)
     if (RULE->m_scale > 0.1)
         m_scale = RULE->m_scale;
     else {
-        autoScale               = true;
-        const auto DEFAULTSCALE = getDefaultScale();
-        m_scale                 = DEFAULTSCALE;
+        autoScale = true;
+        // Keep legacy behavior by default (auto scale from the current mode's context).
+        // Mode-aware reference policy is opt-in.
+        m_scale = *PMODEAWAREAUTOSCALE ? 1.F : getDefaultScale();
     }
 
     m_setScale     = m_scale;
@@ -919,6 +930,9 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule, bool force)
 
     m_pixelSize = m_size;
 
+    if (autoScale && *PMODEAWAREAUTOSCALE)
+        m_scale = computeAutoScaleForMode(m_pixelSize);
+
     // clang-format off
     static const std::array<std::vector<std::pair<std::string, uint32_t>>, 2> formats{
         std::vector<std::pair<std::string, uint32_t>>{ /* 10-bit */
@@ -1127,6 +1141,7 @@ void CMonitor::addDamage(const CBox& box) {
 bool CMonitor::shouldSkipScheduleFrameOnMouseEvent() {
     static auto PNOBREAK = CConfigValue<Hyprlang::INT>("cursor:no_break_fs_vrr");
     static auto PMINRR   = CConfigValue<Hyprlang::INT>("cursor:min_refresh_rate");
+    static auto PSCANOUT = CConfigValue<Hyprlang::INT>("debug:scanout");
 
     // skip scheduling extra frames for fullsreen apps with vrr
     const auto FS_WINDOW          = getFullscreenWindow();
@@ -1134,14 +1149,22 @@ bool CMonitor::shouldSkipScheduleFrameOnMouseEvent() {
     const bool noBreak            = FS_WINDOW && (*PNOBREAK == 1 || (*PNOBREAK == 2 && FS_WINDOW->getContentType() == CONTENT_TYPE_GAME));
     const bool shouldSkip         = (!shouldRenderCursor || noBreak) && m_output->state->state().adaptiveSync;
 
+    bool finalShouldSkip = shouldSkip;
+
     // keep requested minimum refresh rate
     if (shouldSkip && *PMINRR && m_lastPresentationTimer.getMillis() > 1000.0f / *PMINRR) {
         // damage whole screen because some previous cursor box damages were skipped
         m_damage.damageEntire();
-        return false;
+        finalShouldSkip = false;
     }
 
-    return shouldSkip;
+    if (*PSCANOUT && finalShouldSkip != m_lastCursorMoveSkip) {
+        Log::logger->log(Log::TRACE, "cursor scheduling on {}: {} (vrr {}, renderCursor {}, noBreak {}, fullscreen {})", szName, finalShouldSkip ? "skip" : "schedule",
+                         m_output->state->state().adaptiveSync, shouldRenderCursor, noBreak, FS_WINDOW ? FS_WINDOW->m_title : "<none>");
+    }
+
+    m_lastCursorMoveSkip = finalShouldSkip;
+    return finalShouldSkip;
 }
 
 bool CMonitor::isMirror() {
@@ -1154,6 +1177,9 @@ bool CMonitor::matchesStaticSelector(const std::string& selector) const {
         const auto DESCRIPTIONSELECTOR = trim(selector.substr(5));
 
         return m_description.starts_with(DESCRIPTIONSELECTOR) || m_shortDescription.starts_with(DESCRIPTIONSELECTOR);
+    } else if (selector.starts_with("id:")) {
+        const auto IDSELECTOR = trim(selector.substr(3));
+        return m_stableId.starts_with(IDSELECTOR);
     } else {
         // match by selector
         return m_name == selector;
@@ -1315,22 +1341,130 @@ void CMonitor::setMirror(const std::string& mirrorOf) {
     m_events.modeChanged.emit();
 }
 
-float CMonitor::getDefaultScale() {
-    if (!m_enabled)
+std::string CMonitor::stableIdentifier() const {
+    if (!m_output)
+        return m_name;
+
+    auto normalize = [](std::string v) {
+        std::erase(v, ',');
+        return trim(v);
+    };
+
+    const auto make     = normalize(m_output->make);
+    const auto model    = normalize(m_output->model);
+    const auto serial   = normalize(m_output->serial);
+    const auto physSize = m_output->physicalSize;
+
+    // Prefer EDID-like identity when serial is present.
+    if (!serial.empty() && (!make.empty() || !model.empty()))
+        return std::format("edid:{}|{}|{}|{}x{}", make, model, serial, physSize.x, physSize.y);
+
+    // If serial is missing, add connector name to reduce collisions between identical monitors.
+    // This is less stable across connector renames, but avoids accidental conflation.
+    if (!make.empty() || !model.empty())
+        return std::format("mm:{}|{}|{}x{}|{}", make, model, physSize.x, physSize.y, m_name);
+
+    if (!m_shortDescription.empty())
+        return std::format("desc:{}|{}x{}", m_shortDescription, physSize.x, physSize.y);
+
+    if (!m_description.empty())
+        return std::format("desc:{}|{}x{}", m_description, physSize.x, physSize.y);
+
+    return std::format("name:{}|{}x{}", m_name, physSize.x, physSize.y);
+}
+
+Vector2D CMonitor::pickAutoScaleReferenceMode() const {
+    if (!m_output || m_output->modes.empty())
+        return m_pixelSize;
+
+    auto best = m_output->modes.front()->pixelSize;
+    auto area = [](const Vector2D& size) { return size.x * size.y; };
+
+    const bool hasCurrentSize = m_pixelSize.x > 0 && m_pixelSize.y > 0;
+    const auto currentAspect  = hasCurrentSize ? m_pixelSize.x / m_pixelSize.y : 0.F;
+
+    bool       matchedAspect = false;
+
+    for (auto const& mode : m_output->modes) {
+        if (!mode)
+            continue;
+
+        const auto candidate = mode->pixelSize;
+        const bool sameAspect =
+            !hasCurrentSize || (candidate.x > 0 && candidate.y > 0 && std::abs((candidate.x / candidate.y) - currentAspect) < 0.02F);
+
+        if (sameAspect) {
+            if (!matchedAspect || area(candidate) > area(best)) {
+                matchedAspect = true;
+                best          = candidate;
+            }
+            continue;
+        }
+
+        if (!matchedAspect && area(candidate) > area(best))
+            best = mode->pixelSize;
+    }
+
+    return best;
+}
+
+float CMonitor::getDefaultScaleForPixelSize(const Vector2D& pixelSize) const {
+    if (!m_output || pixelSize.x <= 0 || pixelSize.y <= 0)
+        return 1;
+
+    if (m_output->physicalSize.x <= 0 || m_output->physicalSize.y <= 0)
         return 1;
 
     static constexpr double MMPERINCH = 25.4;
 
-    const auto              DIAGONALPX = sqrt(pow(m_pixelSize.x, 2) + pow(m_pixelSize.y, 2));
+    const auto              DIAGONALPX = sqrt(pow(pixelSize.x, 2) + pow(pixelSize.y, 2));
     const auto              DIAGONALIN = sqrt(pow(m_output->physicalSize.x / MMPERINCH, 2) + pow(m_output->physicalSize.y / MMPERINCH, 2));
 
-    const auto              PPI = DIAGONALPX / DIAGONALIN;
+    if (DIAGONALIN <= 0.0)
+        return 1;
+
+    const auto PPI = DIAGONALPX / DIAGONALIN;
 
     if (PPI > 200 /* High PPI, 2x*/)
         return 2;
     else if (PPI > 140 /* Medium PPI, 1.5x*/)
         return 1.5;
     return 1;
+}
+
+float CMonitor::computeAutoScaleForMode(const Vector2D& targetPixelSize) {
+    const auto REFERENCE = pickAutoScaleReferenceMode();
+
+    m_autoReferencePixelSize = REFERENCE;
+    m_autoBaseScale          = getDefaultScaleForPixelSize(REFERENCE);
+
+    if (targetPixelSize.x <= 0 || targetPixelSize.y <= 0 || REFERENCE.x <= 0 || REFERENCE.y <= 0)
+        return std::max(0.25F, m_autoBaseScale);
+
+    const auto targetAspect = targetPixelSize.x / targetPixelSize.y;
+    const auto refAspect    = REFERENCE.x / REFERENCE.y;
+    const auto sameAspect   = std::abs(targetAspect - refAspect) < 0.02F;
+
+    float      normalization = 1.F;
+    if (sameAspect) {
+        const auto ratioX = targetPixelSize.x / REFERENCE.x;
+        const auto ratioY = targetPixelSize.y / REFERENCE.y;
+        const auto ratio  = std::min(ratioX, ratioY);
+
+        // Normalize only for large same-aspect jumps (e.g. dual-mode 1080p <-> 4K).
+        // Small resolution shifts (or refresh-only changes) keep base scale.
+        if (ratio <= 0.7F || ratio >= 1.43F)
+            normalization = ratio;
+    }
+
+    auto roundQuarterStep = [](float v) { return std::round(v * 4.F) / 4.F; };
+
+    const auto effective = roundQuarterStep(m_autoBaseScale * normalization);
+    return std::clamp(effective, 0.25F, 8.F);
+}
+
+float CMonitor::getDefaultScale() const {
+    return getDefaultScaleForPixelSize(m_pixelSize);
 }
 
 static bool shouldWraparound(const WORKSPACEID id1, const WORKSPACEID id2) {
@@ -1737,14 +1871,16 @@ uint32_t CMonitor::isSolitaryBlocked(bool full) {
             return reasons;
     }
 
-    if (!m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY].empty()) {
-        reasons |= SC_OVERLAYS;
-        if (!full)
-            return reasons;
+    for (auto const& overlayls : m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]) {
+        if (overlayls->aliveAndVisible() && overlayls->m_alpha->value() > 0.f) {
+            reasons |= SC_OVERLAYS;
+            if (!full)
+                return reasons;
+        }
     }
 
     for (auto const& topls : m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_TOP]) {
-        if (topls->m_alpha->value() != 0.f) {
+        if (topls->aliveAndVisible() && topls->m_alpha->value() > 0.f) {
             reasons |= SC_OVERLAYS;
             if (!full)
                 return reasons;
@@ -1920,17 +2056,102 @@ uint16_t CMonitor::isDSBlocked(bool full) {
     return reasons;
 }
 
+std::string CMonitor::getDSBlockedReasons(uint16_t reasons) const {
+    if (!reasons)
+        return "none";
+
+    std::vector<std::string> reasonParts;
+    std::vector<std::string> categoryParts;
+
+    for (size_t i = 0; i < DS_REASONS_TEXT.size(); ++i) {
+        if (!(reasons & (1 << i)))
+            continue;
+
+        reasonParts.emplace_back(DS_REASONS_TEXT[i]);
+
+        if ((1 << i) == DS_BLOCK_TRANSFORM)
+            categoryParts.emplace_back("geometry");
+        else if ((1 << i) == DS_BLOCK_SW)
+            categoryParts.emplace_back("cursor");
+        else if ((1 << i) == DS_BLOCK_FAILED)
+            categoryParts.emplace_back("kms");
+        else if ((1 << i) == DS_BLOCK_CM)
+            categoryParts.emplace_back("color");
+        else if ((1 << i) == DS_BLOCK_CANDIDATE || (1 << i) == DS_BLOCK_SURFACE || (1 << i) == DS_BLOCK_DMA)
+            categoryParts.emplace_back("protocol");
+        else if ((1 << i) == DS_BLOCK_WINDOWED || (1 << i) == DS_BLOCK_CONTENT)
+            categoryParts.emplace_back("fullscreen");
+        else if ((1 << i) == DS_BLOCK_MIRROR || (1 << i) == DS_BLOCK_RECORD || (1 << i) == DS_BLOCK_USER)
+            categoryParts.emplace_back("policy");
+    }
+
+    std::string reasonStr;
+    for (const auto& reason : reasonParts) {
+        if (!reasonStr.empty())
+            reasonStr += ", ";
+        reasonStr += reason;
+    }
+
+    std::vector<std::string> uniqueCategories;
+    for (const auto& category : categoryParts) {
+        if (std::ranges::find(uniqueCategories, category) != uniqueCategories.end())
+            continue;
+        uniqueCategories.emplace_back(category);
+    }
+
+    std::string categories;
+    for (const auto& category : uniqueCategories) {
+        if (!categories.empty())
+            categories += "+";
+        categories += category;
+    }
+
+    const auto unknownBits = reasons & ~((1u << DS_REASONS_TEXT.size()) - 1u);
+    if (unknownBits) {
+        if (!reasonStr.empty())
+            reasonStr += ", ";
+        reasonStr += std::format("unknown bits 0x{:x}", unknownBits);
+    }
+
+    if (!categories.empty())
+        return std::format("{} [{}]", reasonStr, categories);
+
+    return reasonStr.empty() ? "unknown reason" : reasonStr;
+}
+
 bool CMonitor::attemptDirectScanout() {
     static const auto PSAME     = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer");
     static const auto PSAMEFIFO = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer_fifo");
+    static const auto PSCANOUT  = CConfigValue<Hyprlang::INT>("debug:scanout");
 
-    const auto        blockedReason = isDSBlocked();
-    if (blockedReason)
+    const auto        blockedReason = isDSBlocked(true);
+    if (blockedReason) {
+        const auto previousReasons = m_lastDSBlockedReasons;
+        m_lastDSBlockedReasons     = blockedReason;
+
+        if (previousReasons != blockedReason) {
+            const auto PCANDIDATE = m_solitaryClient.lock();
+            Log::logger->log(Log::DEBUG, "attemptDirectScanout: blocked on {}: {}", szName, getDSBlockedReasons(blockedReason));
+
+            if (*PSCANOUT && (blockedReason & DS_BLOCK_CANDIDATE))
+                Log::logger->log(Log::TRACE, "attemptDirectScanout: solitary blockers on {}: 0x{:x}", szName, isSolitaryBlocked(true));
+
+            if (*PSCANOUT && (blockedReason & DS_BLOCK_TRANSFORM) && PCANDIDATE) {
+                const auto PSURFACE = PCANDIDATE->getSolitaryResource();
+                if (PSURFACE) {
+                    Log::logger->log(Log::TRACE, "attemptDirectScanout: surface transform mismatch on {}: buffer {} transform {}, monitor needs {} transform {}", szName,
+                                     PSURFACE->m_current.bufferSize, PSURFACE->m_current.transform, m_pixelSize, m_transform);
+                }
+            }
+        }
         return false;
+    }
 
     const auto PCANDIDATE = m_solitaryClient.lock();
     const auto PSURFACE   = PCANDIDATE->getSolitaryResource();
     const auto params     = PSURFACE->m_current.buffer->dmabuf();
+
+    const bool wasBlocked = m_lastDSBlockedReasons != DS_OK;
 
     Log::logger->log(Log::TRACE, "attemptDirectScanout: surface {:x} passed, will attempt, buffer {} fmt: {} -> {} (mod {})", rc<uintptr_t>(PSURFACE.get()),
                      rc<uintptr_t>(PSURFACE->m_current.buffer.m_buffer.get()), m_drmFormat, params.format, params.modifier);
@@ -1944,11 +2165,13 @@ bool CMonitor::attemptDirectScanout() {
         if (m_scanoutNeedsCursorUpdate) {
             if (!m_state.test()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed basic test on cursor update");
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 return false;
             }
 
             if (!m_output->commit()) {
                 Log::logger->log(Log::TRACE, "attemptDirectScanout: failed to commit cursor update");
+                m_lastDSBlockedReasons = DS_BLOCK_FAILED;
                 m_lastScanout.reset();
                 return false;
             }
@@ -1959,6 +2182,10 @@ bool CMonitor::attemptDirectScanout() {
         //#TODO this entire bit is bootleg deluxe, above bit is to not make vrr go down the drain, returning early here means fifo gets forever locked.
         if (PSURFACE->m_fifo && !m_tearingState.activelyTearing && *PSAMEFIFO)
             PSURFACE->m_stateQueue.unlockFirst(LOCK_REASON_FIFO);
+
+        if (wasBlocked)
+            Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+        m_lastDSBlockedReasons = DS_OK;
 
         return true;
     }
@@ -1982,6 +2209,7 @@ bool CMonitor::attemptDirectScanout() {
 
     if (!m_state.test()) {
         Log::logger->log(Log::TRACE, "attemptDirectScanout: failed basic test");
+        m_lastDSBlockedReasons = DS_BLOCK_FAILED;
         return false;
     }
 
@@ -2007,9 +2235,13 @@ bool CMonitor::attemptDirectScanout() {
 
     if (!ok) {
         Log::logger->log(Log::TRACE, "attemptDirectScanout: failed to scanout surface");
+        m_lastDSBlockedReasons = DS_BLOCK_FAILED;
+        m_inFence              = {};
         m_lastScanout.reset();
         return false;
     }
+
+    m_inFence = {};
 
     if (m_lastScanout.expired()) {
         m_lastScanout = PCANDIDATE;
@@ -2017,6 +2249,10 @@ bool CMonitor::attemptDirectScanout() {
     }
 
     m_scanoutNeedsCursorUpdate = false;
+
+    if (wasBlocked)
+        Log::logger->log(Log::TRACE, "attemptDirectScanout: unblocked on {}", szName);
+    m_lastDSBlockedReasons = DS_OK;
 
     if (!PBUFFER->lockedByBackend || PBUFFER->m_hlEvents.backendRelease)
         return true;
