@@ -36,6 +36,32 @@ void CMonitorRuleManager::add(CMonitorRule&& x) {
 }
 
 CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
+    auto selectorMatchesMonitorSafely = [PMONITOR](const std::string& selector) -> bool {
+        if (!selector.starts_with("id:"))
+            return PMONITOR->matchesStaticSelector(selector);
+
+        const auto IDPREFIX = selector.substr(3);
+
+        int        matches = 0;
+        for (auto const& m : g_pCompositor->m_realMonitors) {
+            if (!m || !m->m_output)
+                continue;
+
+            if (m->matchesStaticSelector(selector))
+                ++matches;
+        }
+
+        if (matches <= 1)
+            return PMONITOR->matchesStaticSelector(selector);
+
+        // Ambiguous id prefix: require an exact stable-id match for safety.
+        if (PMONITOR->m_stableId == IDPREFIX)
+            return true;
+
+        Log::logger->log(Log::WARN, "Ignoring ambiguous id: monitor selector '{}' for monitor {} (stable id '{}')", selector, PMONITOR->m_name, PMONITOR->m_stableId);
+        return false;
+    };
+
     auto applyWlrOutputConfig = [PMONITOR](CMonitorRule rule) -> CMonitorRule {
         const auto CONFIG = PROTO::outputManagement->getOutputStateFor(PMONITOR);
 
@@ -78,7 +104,7 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
     };
 
     for (auto const& r : m_rules | std::views::reverse) {
-        if (PMONITOR->matchesStaticSelector(r.m_name))
+        if (selectorMatchesMonitorSafely(r.m_name))
             return applyWlrOutputConfig(r);
     }
 
